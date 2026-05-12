@@ -81,6 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
+          # افزودن ffmpeg قبلاً وجود داشته، فقط برای اطمینان دوباره نصب می‌کنیم
           sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip
           curl -fsSL https://deno.land/install.sh | sh
           export DENO_INSTALL="$HOME/.deno"
@@ -109,16 +110,36 @@ jobs:
           sanitize_name() { echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'; }
           urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
+          # -----------------------------
+          # 🎯 **این بخش کلیدی است و مشکل را حل می‌کند**
+          # یک زنجیره قوی از روش‌های جایگزین تعریف می‌کنیم تا همیشه یک ویدیو با صدا دانلود شود.
+          # -----------------------------
+          # بر اساس کیفیت انتخابی، یک عبارت format قدرتمند می‌سازیم.
           case "$QUALITY" in
-            "audio") FORMAT="bestaudio/bestaudio*/best" ;;
-            "best") FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-            "2160") FORMAT="bestvideo[height<=2160]+bestaudio" ;;
-            "1440") FORMAT="bestvideo[height<=1440]+bestaudio" ;;
-            "1080") FORMAT="bestvideo[height<=1080]+bestaudio" ;;
-            "720")  FORMAT="bestvideo[height<=720]+bestaudio" ;;
-            "480")  FORMAT="bestvideo[height<=480]+bestaudio" ;;
-            *)      FORMAT="bestvideo+bestaudio" ;;
+            "audio")
+              # برای حالت فقط صدا
+              DOWNLOAD_FORMAT="bestaudio/best"
+              ;;
+            "best")
+              # 1. سعی می‌کند بهترین ویدیو و صدا را جداگانه گرفته و با ffmpeg ادغام کند.
+              # 2. اگر نشد، یک فایل mp4 آماده (که در خودش صدا دارد) را با بهترین کیفیت ممکن دانلود می‌کند.
+              # 3. اگر آن هم نبود، ناامیدانه هر فایل mp4 آماده‌ای را دانلود می‌کند.
+              DOWNLOAD_FORMAT="bestvideo+bestaudio/best[ext=mp4]/best"
+              ;;
+            *)
+              # برای کیفیت‌های مشخص مثل 1080، 720 و ...
+              # به دنبال بهترین ویدیو در آن رزولوشن (و پایین‌تر) و بهترین صدا می‌گردد و ادغام می‌کند.
+              # اگر نشد، به دنبال بهترین فایل mp4 آماده (نه بیشتر از کیفیت خواسته شده) می‌گردد.
+              # نهایتاً به سراغ هر فایل mp4 آماده‌ای می‌رود.
+              DOWNLOAD_FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}][ext=mp4]/best[ext=mp4]"
+              ;;
           esac
+
+          echo "Using download format: $DOWNLOAD_FORMAT"
+          # -----------------------------
+          # پایان بخش کلیدی
+          # -----------------------------
+
 
           RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda")
           get_random_word() { echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
@@ -132,17 +153,22 @@ jobs:
 
           download_video() {
             local method=$1 url=$2 dir=$3
-            local flags="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${dir}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --concurrent-fragments 8"
+            # **نکته مهم** دیگر از متغیر FORMAT استفاده نمی‌کنیم و مستقیماً از DOWNLOAD_FORMAT جدید استفاده می‌کنیم.
+            echo "Attempting download with method: $method and format: ${DOWNLOAD_FORMAT}"
+
+            local flags="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${dir}/%(title)s.%(ext)s --no-part --no-playlist --retries 10 --fragment-retries 10 --concurrent-fragments 8 --format \"${DOWNLOAD_FORMAT}\""
+
             [ "$QUALITY" = "audio" ] && flags="--extract-audio --audio-format mp3 --audio-quality 0 $flags"
+
             case $method in
-              1) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
-              2) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm "$url" ;;
-              3) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$url" ;;
-              4) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
-              5) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=android_vr" "$url" ;;
-              6) yt-dlp --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
-              7) yt-dlp --format "$FORMAT" $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
-              8) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=android" "$url" ;;
+              1) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              2) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm "$url" ;;
+              3) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              4) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
+              5) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=android_vr" "$url" ;;
+              6) yt-dlp $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              7) yt-dlp $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
+              8) yt-dlp --proxy socks5://127.0.0.1:1080 $flags --extractor-args "youtube:player_client=android" "$url" ;;
             esac
           }
 
@@ -166,12 +192,18 @@ jobs:
             success=false
             for m in 1 2 3 4 5 6 7 8; do
               if download_video $m "$url" "$TMP_DIR"; then
+                echo "✅ Download successful with method $m!"
                 success=true
                 break
               fi
+              echo "Method $m failed, waiting 3 seconds before next attempt..."
               sleep 3
             done
-            if [ "$success" = false ]; then rm -rf "$TMP_DIR"; continue; fi
+            if [ "$success" = false ]; then
+              echo "❌ All download methods failed for URL: $url — skipping."
+              rm -rf "$TMP_DIR"
+              continue
+            fi
 
             find "$TMP_DIR" -name "*.part" -delete
 
@@ -193,7 +225,7 @@ jobs:
 
               if [ "$size" -gt "$SPLIT_BYTES" ]; then
                 if [ -n "$ZIP_PASS" ]; then
-                  7z a -tzip -v${SPLIT_MB}m -p"$ZIP_PASS" -mx=0 "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
+                  zip -0 -P "$ZIP_PASS" -s ${SPLIT_MB}m "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                 else
                   zip -0 -s ${SPLIT_MB}m "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                 fi
