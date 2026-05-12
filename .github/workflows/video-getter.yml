@@ -32,7 +32,7 @@ on:
         type: string
 
 jobs:
-  get-video:
+  download-and-save:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -42,25 +42,18 @@ jobs:
       - name: Check URL provided
         run: |
           if [ -z "${{ github.event.inputs.video_urls }}" ]; then
-            echo ""
             echo "❌ لینک ویدیو وارد نشده است!"
-            echo ""
-            echo "📌 راهنما:"
-            echo "   1️⃣ workflow را دوباره اجرا کنید"
-            echo "   2️⃣ در فیلد 'لینک ویدیو' آدرس را وارد کنید"
-            echo "   3️⃣ برای چند ویدیو، لینک‌ها را با فاصله جدا کنید"
-            echo ""
             exit 1
           fi
           echo "✅ لینک ویدیو دریافت شد"
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Configure Git
+      - name: Configure Git for large files
         run: |
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
@@ -71,7 +64,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-      - name: Start WARP container
+      - name: Start Cloudflare WARP
         run: |
           docker network create warp-net || true
           docker run -d \
@@ -85,6 +78,7 @@ jobs:
             -v warp-data:/var/lib/cloudflare-warp \
             caomingjun/warp
           sleep 15
+          echo "WARP proxy started on socks5://127.0.0.1:1080"
 
       - name: Install dependencies
         run: |
@@ -96,259 +90,231 @@ jobs:
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
           pip3 install --upgrade yt-dlp
 
-      - name: Setup download environment
-        env:
-          YT_URLS: ${{ github.event.inputs.video_urls }}
-          YT_QUALITY: ${{ github.event.inputs.quality }}
-          YT_PASSWORD: ${{ github.event.inputs.password }}
-          REPO_OWNER_ENV: ${{ github.repository_owner }}
-          REPO_NAME_ENV: ${{ github.event.repository.name }}
-          BRANCH_ENV: ${{ github.ref_name }}
+      - name: Download videos
         run: |
-          URLS_RAW="${YT_URLS}"
-          read -ra URL_LIST <<< "$URLS_RAW"
-          TOTAL_URLS=${#URL_LIST[@]}
-
-          QUALITY="${YT_QUALITY}"
-          ZIP_PASSWORD="${YT_PASSWORD}"
+          URLS="${{ github.event.inputs.video_urls }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          ZIP_PASS="${{ github.event.inputs.password }}"
           DOWNLOAD_SUBS="${{ github.event.inputs.download_subtitles }}"
 
           SPLIT_MB=45
           SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
-
           BACKUP_DIR="/tmp/video_backup_$$"
-          mkdir -p "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR" videos
           echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
-
-          mkdir -p videos
           > /tmp/video_info.txt
 
-          echo "=========================================="
-          echo "YouTube Video Downloader"
-          echo "=========================================="
-          echo "Total URLs: $TOTAL_URLS"
+          echo "======================================"
+          echo "YouTube Downloader Started"
           echo "Quality: $QUALITY"
-          echo "Password: $(if [ -n "$ZIP_PASSWORD" ]; then echo "Enabled"; else echo "Disabled"; fi)"
-          echo "Subtitles: $(if [ "$DOWNLOAD_SUBS" = "true" ]; then echo "Enabled"; else echo "Disabled"; fi)"
+          echo "Password: $(if [ -n "$ZIP_PASS" ]; then echo "ON"; else echo "OFF"; fi)"
+          echo "Subtitles: $DOWNLOAD_SUBS"
+          echo "======================================"
 
-          sanitize_name() {
-            echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'
-          }
-
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
+          sanitize_name() { echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'; }
+          urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
           case "$QUALITY" in
             "audio") FORMAT="bestaudio/bestaudio*/best" ;;
             "best") FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-            "2160") FORMAT="bestvideo[height<=2160]+bestaudio/bestvideo[height<=2160]*+bestaudio*/bestvideo+bestaudio/best" ;;
-            "1440") FORMAT="bestvideo[height<=1440]+bestaudio/bestvideo[height<=1440]*+bestaudio*/bestvideo+bestaudio/best" ;;
-            "1080") FORMAT="bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]*+bestaudio*/bestvideo+bestaudio/best" ;;
-            "720") FORMAT="bestvideo[height<=720]+bestaudio/bestvideo[height<=720]*+bestaudio*/bestvideo+bestaudio/best" ;;
-            "480") FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/bestvideo+bestaudio/best" ;;
-            *) FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+            "2160") FORMAT="bestvideo[height<=2160]+bestaudio" ;;
+            "1440") FORMAT="bestvideo[height<=1440]+bestaudio" ;;
+            "1080") FORMAT="bestvideo[height<=1080]+bestaudio" ;;
+            "720")  FORMAT="bestvideo[height<=720]+bestaudio" ;;
+            "480")  FORMAT="bestvideo[height<=480]+bestaudio" ;;
+            *)      FORMAT="bestvideo+bestaudio" ;;
           esac
 
-          download_video() {
-            local METHOD=$1 URL=$2 TMP_DIR=$3
-            if [ "$QUALITY" = "audio" ]; then
-              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            else
-              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            fi
-            case $METHOD in
-              1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$URL" ;;
-              2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm "$URL" ;;
-              3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              5) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android_vr" "$URL" ;;
-              6) yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              7) yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              8) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12)" "$URL" ;;
-            esac
-          }
-
-          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega")
           get_random_word() { echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
           get_unique_folder() {
-            local BASE_PATH="$1" NAME="$2"
-            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then echo "$NAME"; return; fi
-            local RANDOM_SUFFIX=$(get_random_word)
-            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
-              RANDOM_SUFFIX=$(get_random_word)
-            done
-            echo "${NAME}_${RANDOM_SUFFIX}"
-          }
-
-          echo "$FORMAT" > /tmp/yt_format.txt
-          echo "$QUALITY" > /tmp/yt_quality.txt
-          echo "$ZIP_PASSWORD" > /tmp/yt_password.txt
-          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
-          echo "${{ github.repository_owner }}" > /tmp/yt_repo_owner.txt
-          echo "${{ github.event.repository.name }}" > /tmp/yt_repo_name.txt
-          echo "${{ github.ref_name }}" > /tmp/yt_branch.txt
-          printf "%s\n" "${URL_LIST[@]}" > /tmp/yt_urls.txt
-
-      - name: Download videos
-        run: |
-          FORMAT=$(cat /tmp/yt_format.txt)
-          QUALITY=$(cat /tmp/yt_quality.txt)
-          ZIP_PASSWORD=$(cat /tmp/yt_password.txt)
-          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
-          REPO_OWNER=$(cat /tmp/yt_repo_owner.txt)
-          REPO_NAME=$(cat /tmp/yt_repo_name.txt)
-          BRANCH=$(cat /tmp/yt_branch.txt)
-          SPLIT_MB=45
-          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
-          mapfile -t URL_LIST < /tmp/yt_urls.txt
-
-          sanitize_name() { echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'; }
-          urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
-          get_random_word() { RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain"); echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
-          get_unique_folder() {
-            local BASE_PATH="$1" NAME="$2"
-            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then echo "$NAME"; return; fi
-            local RANDOM_SUFFIX=$(get_random_word)
-            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
-              RANDOM_SUFFIX=$(get_random_word)
-            done
-            echo "${NAME}_${RANDOM_SUFFIX}"
+            local base="$1" name="$2"
+            if [ ! -d "$base/$name" ] && [ ! -d "$BACKUP_DIR/$name" ]; then echo "$name"; return; fi
+            local suffix=$(get_random_word)
+            while [ -d "$base/${name}_${suffix}" ] || [ -d "$BACKUP_DIR/${name}_${suffix}" ]; do suffix=$(get_random_word); done
+            echo "${name}_${suffix}"
           }
 
           download_video() {
-            local METHOD=$1 URL=$2 TMP_DIR=$3
-            if [ "$QUALITY" = "audio" ]; then
-              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            else
-              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            fi
-            case $METHOD in
-              1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$URL" ;;
-              2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm "$URL" ;;
-              3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              5) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android_vr" "$URL" ;;
-              6) yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              7) yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              8) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12)" "$URL" ;;
+            local method=$1 url=$2 dir=$3
+            local flags="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${dir}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --concurrent-fragments 8"
+            [ "$QUALITY" = "audio" ] && flags="--extract-audio --audio-format mp3 --audio-quality 0 $flags"
+            case $method in
+              1) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              2) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm "$url" ;;
+              3) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              4) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
+              5) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=android_vr" "$url" ;;
+              6) yt-dlp --format "$FORMAT" $flags --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$url" ;;
+              7) yt-dlp --format "$FORMAT" $flags --extractor-args "youtube:player_client=mweb" "$url" ;;
+              8) yt-dlp --proxy socks5://127.0.0.1:1080 --format "$FORMAT" $flags --extractor-args "youtube:player_client=android" "$url" ;;
             esac
           }
 
-          normalize_url() {
-            local URL="$1"
-            if [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
-              echo "https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
-            else
-              echo "$URL"
-            fi
-          }
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${{ github.ref_name }}"
 
-          TOTAL_URLS=${#URL_LIST[@]}
-          URL_INDEX=0
-          for URL in "${URL_LIST[@]}"; do
-            URL_INDEX=$((URL_INDEX + 1))
-            URL=$(normalize_url "$URL")
-            echo "Processing $URL_INDEX/$TOTAL_URLS: $URL"
-            TMP_DIR="tmp_downloads_${URL_INDEX}"
+          IFS=' ' read -ra URL_ARRAY <<< "$URLS"
+          idx=0
+          for raw_url in "${URL_ARRAY[@]}"; do
+            idx=$((idx+1))
+            # Normalize youtu.be
+            if [[ "$raw_url" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
+              url="https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
+            else
+              url="$raw_url"
+            fi
+            echo "Processing ($idx/${#URL_ARRAY[@]}): $url"
+            TMP_DIR="tmp_dl_$idx"
             mkdir -p "$TMP_DIR"
 
-            DOWNLOAD_SUCCESS=false
-            for METHOD in 1 2 3 4 5 6 7 8; do
-              if download_video $METHOD "$URL" "$TMP_DIR"; then
-                DOWNLOAD_SUCCESS=true
+            success=false
+            for m in 1 2 3 4 5 6 7 8; do
+              if download_video $m "$url" "$TMP_DIR"; then
+                success=true
                 break
               fi
               sleep 3
             done
-
-            if [ "$DOWNLOAD_SUCCESS" = false ]; then
-              rm -rf "$TMP_DIR"
-              continue
-            fi
+            if [ "$success" = false ]; then rm -rf "$TMP_DIR"; continue; fi
 
             find "$TMP_DIR" -name "*.part" -delete
 
-            for FILE in "$TMP_DIR"/*; do
-              [ -f "$FILE" ] || continue
-              [[ "$FILE" == *.jpg || "$FILE" == *.webp ]] && continue
+            for file in "$TMP_DIR"/*; do
+              [ -f "$file" ] || continue
+              [[ "$file" == *.jpg || "$file" == *.webp ]] && continue
+              size=$(stat -c%s "$file")
+              fname=$(basename "$file")
+              base="${fname%.*}"
+              base=$(sanitize_name "$base")
+              final_folder=$(get_unique_folder "videos" "$base")
+              mkdir -p "$BACKUP_DIR/$final_folder"
 
-              SIZE=$(stat -c%s "$FILE")
-              BASENAME=$(basename "$FILE")
-              NAME_NO_EXT="${BASENAME%.*}"
-              NAME_NO_EXT=$(sanitize_name "$NAME_NO_EXT")
+              thumb=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
+              [ -n "$thumb" ] && cp "$thumb" "$BACKUP_DIR/$final_folder/thumbnail.jpg"
 
-              FINAL_NAME=$(get_unique_folder "videos" "$NAME_NO_EXT")
-              mkdir -p "$BACKUP_DIR/${FINAL_NAME}"
+              echo "$base|$final_folder|$url" >> /tmp/video_info.txt
+              encoded_folder=$(urlencode "$final_folder")
 
-              THUMB=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
-              [ -n "$THUMB" ] && cp "$THUMB" "$BACKUP_DIR/${FINAL_NAME}/thumbnail.jpg"
-
-              echo "$NAME_NO_EXT|${FINAL_NAME}|$URL" >> /tmp/video_info.txt
-              FOLDER_ENCODED=$(urlencode "$FINAL_NAME")
-
-              if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
-                if [ -n "$ZIP_PASSWORD" ]; then
-                  7z a -tzip -v${SPLIT_MB}m -p"${ZIP_PASSWORD}" -mx=0 "$BACKUP_DIR/${FINAL_NAME}/${FINAL_NAME}.zip" "$FILE"
+              if [ "$size" -gt "$SPLIT_BYTES" ]; then
+                if [ -n "$ZIP_PASS" ]; then
+                  7z a -tzip -v${SPLIT_MB}m -p"$ZIP_PASS" -mx=0 "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                 else
-                  zip -0 -s ${SPLIT_MB}m "$BACKUP_DIR/${FINAL_NAME}/${FINAL_NAME}.zip" "$FILE"
+                  zip -0 -s ${SPLIT_MB}m "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                 fi
-                printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **%s** |\n\n## Download Links\n\nDownload all parts, then open `%s.zip`\n\n' "$NAME_NO_EXT" "$NAME_NO_EXT" "$URL" "$QUALITY" "$(if [ -n "$ZIP_PASSWORD" ]; then echo "YES"; else echo "NO"; fi)" "$FINAL_NAME" > "$BACKUP_DIR/${FINAL_NAME}/README.md"
-                PART_NUM=0
-                for PART in $(ls "$BACKUP_DIR/${FINAL_NAME}/"*.zip "$BACKUP_DIR/${FINAL_NAME}/"*.z[0-9]* 2>/dev/null | sort -V); do
-                  PART_NUM=$((PART_NUM + 1))
-                  PART_NAME=$(basename "$PART")
-                  PART_ENCODED=$(urlencode "$PART_NAME")
-                  echo "- Part $PART_NUM: [$PART_NAME](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${PART_ENCODED})" >> "$BACKUP_DIR/${FINAL_NAME}/README.md"
+                cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
+# $base
+
+---
+
+## Video Information
+
+| Property | Value |
+|----------|-------|
+| **Video Name** | \`$base\` |
+| **Original Link** | [YouTube Video]($url) |
+| **Quality** | **$QUALITY** |
+| **Password Protected** | **$(if [ -n "$ZIP_PASS" ]; then echo "YES"; else echo "NO"; fi)** |
+
+## Download Links
+
+Download all parts, then open \`$final_folder.zip\`
+
+EOR
+                part_num=0
+                for part in $(ls "$BACKUP_DIR/$final_folder/"*.zip "$BACKUP_DIR/$final_folder/"*.z[0-9]* 2>/dev/null | sort -V); do
+                  part_num=$((part_num+1))
+                  part_name=$(basename "$part")
+                  part_enc=$(urlencode "$part_name")
+                  echo "- Part $part_num: [$part_name](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${part_enc})" >> "$BACKUP_DIR/$final_folder/README.md"
                 done
               else
-                if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -0 -P "${ZIP_PASSWORD}" "$BACKUP_DIR/${FINAL_NAME}/${FINAL_NAME}.zip" "$FILE"
-                  FILE_ENCODED=$(urlencode "${FINAL_NAME}.zip")
-                  printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **YES** |\n\n## Download Link\n\n[%s.zip](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED})\n\n' "$NAME_NO_EXT" "$NAME_NO_EXT" "$URL" "$QUALITY" "$FINAL_NAME" > "$BACKUP_DIR/${FINAL_NAME}/README.md"
+                if [ -n "$ZIP_PASS" ]; then
+                  zip -0 -P "$ZIP_PASS" "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
+                  enc_file=$(urlencode "$final_folder.zip")
+                  cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
+# $base
+
+---
+
+## Video Information
+
+| Property | Value |
+|----------|-------|
+| **Video Name** | \`$base\` |
+| **Original Link** | [YouTube Video]($url) |
+| **Quality** | **$QUALITY** |
+| **Password Protected** | **YES** |
+
+## Download Link
+
+[${final_folder}.zip](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${enc_file})
+
+EOR
                 else
-                  cp "$FILE" "$BACKUP_DIR/${FINAL_NAME}/${FINAL_NAME}.${BASENAME##*.}"
-                  FILE_ENCODED=$(urlencode "${FINAL_NAME}.${BASENAME##*.}")
-                  printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **NO** |\n\n## Download Link\n\n[%s.%s](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED})\n\n' "$NAME_NO_EXT" "$NAME_NO_EXT" "$URL" "$QUALITY" "$FINAL_NAME" "${BASENAME##*.}" > "$BACKUP_DIR/${FINAL_NAME}/README.md"
+                  ext="${fname##*.}"
+                  cp "$file" "$BACKUP_DIR/$final_folder/$final_folder.$ext"
+                  enc_file=$(urlencode "$final_folder.$ext")
+                  cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
+# $base
+
+---
+
+## Video Information
+
+| Property | Value |
+|----------|-------|
+| **Video Name** | \`$base\` |
+| **Original Link** | [YouTube Video]($url) |
+| **Quality** | **$QUALITY** |
+| **Password Protected** | **NO** |
+
+## Download Link
+
+[${final_folder}.${ext}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${enc_file})
+
+EOR
                 fi
               fi
             done
             rm -rf "$TMP_DIR"
           done
 
-      - name: Download subtitles
+      - name: Download subtitles (optional)
         if: ${{ github.event.inputs.download_subtitles == 'true' }}
         run: |
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
-          while IFS='|' read -r NAME FOLDER URL; do
-            [ -z "$FOLDER" ] && continue
-            SUB_DIR="$BACKUP_DIR/${FOLDER}/subtitle"
-            mkdir -p "$SUB_DIR"
-            for METHOD in 1 2 3 4 5 6 7 8; do
-              yt-dlp --proxy "socks5://127.0.0.1:1080" --write-sub --sub-langs fa,en --sub-format vtt --convert-subs vtt --skip-download --output "$SUB_DIR/%(title)s.%(ext)s" "$URL" 2>&1 && break
+          while IFS='|' read -r name folder url; do
+            [ -z "$folder" ] && continue
+            sub_dir="$BACKUP_DIR/$folder/subtitle"
+            mkdir -p "$sub_dir"
+            for method in 1 2 3 4 5 6 7 8; do
+              yt-dlp --proxy socks5://127.0.0.1:1080 --write-sub --sub-langs fa,en --sub-format vtt --convert-subs vtt --skip-download --output "$sub_dir/%(title)s.%(ext)s" "$url" 2>&1 && break
               sleep 2
             done
-            if [ "$(find "$SUB_DIR" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
-              (cd "$SUB_DIR" && zip -j "$BACKUP_DIR/${FOLDER}/subtitles.zip" ./* 2>&1) && rm -rf "$SUB_DIR"
+            if [ "$(find "$sub_dir" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+              (cd "$sub_dir" && zip -j "$BACKUP_DIR/$folder/subtitles.zip" ./*) && rm -rf "$sub_dir"
             else
-              rmdir "$SUB_DIR" 2>/dev/null || true
+              rmdir "$sub_dir" 2>/dev/null || true
             fi
           done < /tmp/video_info.txt
 
-      - name: Stop WARP
+      - name: Stop WARP container
         if: always()
-        run: |
-          docker stop warp || true
-          docker rm warp || true
+        run: docker stop warp || true; docker rm warp || true
 
-      - name: Push to repository
+      - name: Push videos to repository
         run: |
-          BRANCH=$(cat /tmp/yt_branch.txt)
-          REPO_OWNER=$(cat /tmp/yt_repo_owner.txt)
-          REPO_NAME=$(cat /tmp/yt_repo_name.txt)
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${{ github.ref_name }}"
 
-          [ -z "$(find "$BACKUP_DIR" -type f 2>/dev/null)" ] && echo "No files to push" && exit 0
+          if [ -z "$(find "$BACKUP_DIR" -type f 2>/dev/null)" ]; then
+            echo "No files to push"
+            exit 0
+          fi
 
           urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
@@ -363,12 +329,13 @@ jobs:
 | # | Video | Link |
 |---|-------|------|
 EOF
-          COUNTER=1
+          counter=1
           for folder in videos/*/; do
             [ -d "$folder" ] || continue
-            FOLDER_NAME=$(basename "$folder")
-            echo "| $COUNTER | $FOLDER_NAME | [Open](./$(urlencode "$FOLDER_NAME")/) |" >> videos/README.md
-            COUNTER=$((COUNTER + 1))
+            fname=$(basename "$folder")
+            enc=$(urlencode "$fname")
+            echo "| $counter | $fname | [Open](./$enc/) |" >> videos/README.md
+            counter=$((counter+1))
           done
 
           git add videos/
@@ -377,6 +344,7 @@ EOF
             git push origin HEAD:"$BRANCH" && break || sleep 5
             git fetch origin "$BRANCH" && git reset --hard origin/"$BRANCH"
             mkdir -p videos && cp -r "$BACKUP_DIR"/* videos/
-            git add videos/ && git diff --cached --quiet || git commit -m "Add YouTube videos [skip ci]"
+            git add videos/
+            git diff --cached --quiet || git commit -m "Add YouTube videos [skip ci]"
           done
-          echo "Done!"
+          echo "✅ All videos uploaded successfully"
