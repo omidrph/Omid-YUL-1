@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       video_urls:
-        description: '🔗 لینک ویدیو (چند لینک با فاصله)'
+        description: '🔗 لینک ویدیو ( چند لینک با فاصله )'
         required: true
         type: string
       download_subtitles:
-        description: '📝 زیرنویس (فارسی و انگلیسی)'
+        description: '📝 زیرنویس ( فارسی و انگلیسی )'
         required: false
         default: false
         type: boolean
@@ -26,14 +26,14 @@ on:
           - 480
           - audio
       password:
-        description: '🔒 رمز (اختیاری برای محافظت)'
+        description: '🔒 رمز ( اختیاری برای محافظت )'
         required: false
         default: ''
         type: string
 
 jobs:
-  download-video:
-    name: "📥 دانلود ویدیو از یوتیوب"
+  get-video:
+    name: "📥 دانلود ویدیو"
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -55,13 +55,13 @@ jobs:
           fi
           echo "✅ لینک ویدیو دریافت شد"
 
-      - name: Checkout repository
+      - name: بررسی اولیه
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Configure Git for large files
+      - name: آماده سازی گیت برای فایلهای بزرگ
         run: |
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
@@ -73,20 +73,7 @@ jobs:
           git config user.email "github-actions@github.com"
           echo "Git configured for large file handling"
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip
-
-          curl -fsSL https://deno.land/install.sh | sh
-          export DENO_INSTALL="$HOME/.deno"
-          export PATH="$DENO_INSTALL/bin:$PATH"
-          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
-          deno --version
-
-          pip3 install --upgrade yt-dlp
-
-      - name: Start WARP proxy (for bypass)
+      - name: شروع کانتینر
         run: |
           echo "Starting Cloudflare WARP container..."
 
@@ -124,13 +111,37 @@ jobs:
             echo "WARP proxy is ready!"
           else
             echo "WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
           fi
 
-      - name: Download videos from YouTube
+      - name: نصب پیش نیازها
         run: |
-          URLS="${{ github.event.inputs.video_urls }}"
-          QUALITY="${{ github.event.inputs.quality }}"
-          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip
+
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          deno --version
+
+          pip3 install --upgrade yt-dlp
+
+      - name: دانلود تنظیمات
+        env:
+          YT_URLS: ${{ github.event.inputs.video_urls }}
+          YT_QUALITY: ${{ github.event.inputs.quality }}
+          YT_PASSWORD: ${{ github.event.inputs.password }}
+          REPO_OWNER_ENV: ${{ github.repository_owner }}
+          REPO_NAME_ENV: ${{ github.event.repository.name }}
+          BRANCH_ENV: ${{ github.ref_name }}
+        run: |
+          URLS_RAW="${YT_URLS}"
+          read -ra URL_LIST <<< "$URLS_RAW"
+          TOTAL_URLS=${#URL_LIST[@]}
+
+          QUALITY="${YT_QUALITY}"
+          ZIP_PASSWORD="${YT_PASSWORD}"
           DOWNLOAD_SUBS="${{ github.event.inputs.download_subtitles }}"
 
           SPLIT_MB=45
@@ -144,10 +155,10 @@ jobs:
           > /tmp/video_info.txt
 
           echo "=========================================="
-          echo "🎬 YouTube Downloader Started"
+          echo "YouTube Video Downloader"
           echo "=========================================="
+          echo "Total URLs to download: $TOTAL_URLS"
           echo "Quality: $QUALITY"
-          echo "Split size: ${SPLIT_MB}MB"
           if [ -n "$ZIP_PASSWORD" ]; then
             echo "Password protection: ENABLED"
           else
@@ -158,7 +169,7 @@ jobs:
           else
             echo "Subtitles: DISABLED"
           fi
-          echo "=========================================="
+          echo ""
 
           sanitize_name() {
             echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'
@@ -168,7 +179,6 @@ jobs:
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          # Format selection based on quality
           case "$QUALITY" in
             "audio")
               FORMAT="bestaudio/bestaudio*/best"
@@ -176,10 +186,10 @@ jobs:
             "best")
               FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best"
               ;;
-            "2160")
+            "2160"|"4k")
               FORMAT="bestvideo[height<=2160]+bestaudio/bestvideo[height<=2160]*+bestaudio*/bestvideo+bestaudio/best"
               ;;
-            "1440")
+            "1440"|"2k")
               FORMAT="bestvideo[height<=1440]+bestaudio/bestvideo[height<=1440]*+bestaudio*/bestvideo+bestaudio/best"
               ;;
             "1080")
@@ -196,6 +206,99 @@ jobs:
               ;;
           esac
 
+          download_video() {
+            local METHOD=$1
+            local URL=$2
+            local TMP_DIR=$3
+            echo "Trying download method $METHOD..."
+
+            if [ "$QUALITY" = "audio" ]; then
+              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            elif [ "$QUALITY" = "best" ]; then
+              COMMON_FLAGS="--merge-output-format mp4 --format-sort res,+codec:vp9.1,+size --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            else
+              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            fi
+
+            case $METHOD in
+              1)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  "$URL"
+                ;;
+              2)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:npm \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  "$URL"
+                ;;
+              3)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web,mweb,android_vr" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  "$URL"
+                ;;
+              4)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=mweb" \
+                  "$URL"
+                ;;
+              5)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=android_vr" \
+                  "$URL"
+                ;;
+              6)
+                yt-dlp \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  "$URL"
+                ;;
+              7)
+                yt-dlp \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=mweb" \
+                  "$URL"
+                ;;
+              8)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=android" \
+                  --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" \
+                  "$URL"
+                ;;
+            esac
+          }
+
           RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
 
           get_random_word() {
@@ -205,6 +308,7 @@ jobs:
           get_unique_folder() {
             local BASE_PATH="$1"
             local NAME="$2"
+
             if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
               echo "$NAME"
               return
@@ -214,6 +318,146 @@ jobs:
               RANDOM_SUFFIX=$(get_random_word)
             done
             echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+
+          REPO_OWNER="${REPO_OWNER_ENV}"
+          REPO_NAME="${REPO_NAME_ENV}"
+          BRANCH="${BRANCH_ENV}"
+
+          echo "$FORMAT" > /tmp/yt_format.txt
+          echo "$QUALITY" > /tmp/yt_quality.txt
+          echo "$ZIP_PASSWORD" > /tmp/yt_password.txt
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+          echo "$REPO_OWNER_ENV" > /tmp/yt_repo_owner.txt
+          echo "$REPO_NAME_ENV" > /tmp/yt_repo_name.txt
+          echo "$BRANCH_ENV" > /tmp/yt_branch.txt
+          printf "%s\n" "${URL_LIST[@]}" > /tmp/yt_urls.txt
+
+      - name: دانلود ویدیو
+        run: |
+          FORMAT=$(cat /tmp/yt_format.txt)
+          QUALITY=$(cat /tmp/yt_quality.txt)
+          ZIP_PASSWORD=$(cat /tmp/yt_password.txt)
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          REPO_OWNER=$(cat /tmp/yt_repo_owner.txt)
+          REPO_NAME=$(cat /tmp/yt_repo_name.txt)
+          BRANCH=$(cat /tmp/yt_branch.txt)
+          SPLIT_MB=45
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+          mapfile -t URL_LIST < /tmp/yt_urls.txt
+          TOTAL_URLS=${#URL_LIST[@]}
+
+          sanitize_name() {
+            echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'
+          }
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+          get_random_word() {
+            RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+            echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
+          }
+          get_unique_folder() {
+            local BASE_PATH="$1"
+            local NAME="$2"
+            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
+              echo "$NAME"; return
+            fi
+            local RANDOM_SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
+              RANDOM_SUFFIX=$(get_random_word)
+            done
+            echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+          download_video() {
+            local METHOD=$1
+            local URL=$2
+            local TMP_DIR=$3
+            echo "Trying download method $METHOD..."
+            if [ "$QUALITY" = "audio" ]; then
+              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            elif [ "$QUALITY" = "best" ]; then
+              COMMON_FLAGS="--merge-output-format mp4 --format-sort res,+codec:vp9.1,+size --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            else
+              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            fi
+            case $METHOD in
+              1)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  "$URL"
+                ;;
+              2)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:npm \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  "$URL"
+                ;;
+              3)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web,mweb,android_vr" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  "$URL"
+                ;;
+              4)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=mweb" \
+                  "$URL"
+                ;;
+              5)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=android_vr" \
+                  "$URL"
+                ;;
+              6)
+                yt-dlp \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=web" \
+                  --js-runtimes deno \
+                  --remote-components ejs:github \
+                  "$URL"
+                ;;
+              7)
+                yt-dlp \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=mweb" \
+                  "$URL"
+                ;;
+              8)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  $COMMON_FLAGS \
+                  --extractor-args "youtube:player_client=android" \
+                  --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" \
+                  "$URL"
+                ;;
+            esac
           }
 
           normalize_youtube_url() {
@@ -227,64 +471,10 @@ jobs:
             fi
           }
 
-          download_video() {
-            local METHOD=$1
-            local URL=$2
-            local TMP_DIR=$3
-
-            if [ "$QUALITY" = "audio" ]; then
-              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            else
-              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-            fi
-
-            case $METHOD in
-              1)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL"
-                ;;
-              2)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL"
-                ;;
-              3)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL"
-                ;;
-              4)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL"
-                ;;
-              5)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android_vr" "$URL"
-                ;;
-              6)
-                yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL"
-                ;;
-              7)
-                yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL"
-                ;;
-              8)
-                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "$URL"
-                ;;
-            esac
-          }
-
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          BRANCH="${GITHUB_REF_NAME}"
-
-          echo "$FORMAT" > /tmp/yt_format.txt
-          echo "$QUALITY" > /tmp/yt_quality.txt
-          echo "$ZIP_PASSWORD" > /tmp/yt_password.txt
-          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
-          echo "$REPO_OWNER" > /tmp/yt_repo_owner.txt
-          echo "$REPO_NAME" > /tmp/yt_repo_name.txt
-          echo "$BRANCH" > /tmp/yt_branch.txt
-
-          IFS=' ' read -ra URL_ARRAY <<< "$URLS"
-          printf "%s\n" "${URL_ARRAY[@]}" > /tmp/yt_urls.txt
-          TOTAL_URLS=${#URL_ARRAY[@]}
-
           URL_INDEX=0
-          for URL in "${URL_ARRAY[@]}"; do
+          for URL in "${URL_LIST[@]}"; do
             URL_INDEX=$((URL_INDEX + 1))
+
             URL=$(normalize_youtube_url "$URL")
 
             echo ""
@@ -295,15 +485,18 @@ jobs:
             TMP_DIR="tmp_downloads_${URL_INDEX}"
             mkdir -p "$TMP_DIR"
 
+            echo "Checking available formats..."
+            yt-dlp -F --proxy "socks5://127.0.0.1:1080" --js-runtimes deno --remote-components ejs:github "$URL" || echo "Could not list formats (will proceed with download)"
+            echo ""
+
             DOWNLOAD_SUCCESS=false
             for METHOD in 1 2 3 4 5 6 7 8; do
-              echo "Trying download method $METHOD..."
               if download_video $METHOD "$URL" "$TMP_DIR"; then
-                echo "✅ Download successful with method $METHOD!"
+                echo "Download successful with method $METHOD!"
                 DOWNLOAD_SUCCESS=true
                 break
               else
-                echo "Method $METHOD failed, waiting 3 seconds..."
+                echo "Method $METHOD failed, waiting 3 seconds before next attempt..."
                 sleep 3
               fi
             done
@@ -316,11 +509,14 @@ jobs:
 
             find "$TMP_DIR" -name "*.part" -delete
 
+            echo "Download complete!"
             echo "Files in $TMP_DIR:"
             ls -la "$TMP_DIR/"
 
+            FILE_INDEX=0
             for FILE in "$TMP_DIR"/*; do
               [ -f "$FILE" ] || continue
+
               if [[ "$FILE" == *.jpg ]] || [[ "$FILE" == *.webp ]]; then
                 continue
               fi
@@ -329,30 +525,74 @@ jobs:
               BASENAME=$(basename "$FILE")
               FILENAME_NO_EXT="${BASENAME%.*}"
               EXT="${BASENAME##*.}"
+              FILE_INDEX=$((FILE_INDEX + 1))
+
               FILENAME_NO_EXT=$(sanitize_name "$FILENAME_NO_EXT")
 
+              echo ""
               echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+              echo "Sanitized name: $FILENAME_NO_EXT"
 
               FINAL_FOLDER_NAME=$(get_unique_folder "videos" "$FILENAME_NO_EXT")
+
               mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
+              echo "Created backup folder: $BACKUP_DIR/${FINAL_FOLDER_NAME}"
 
               THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
               if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
                 cp "$THUMB_FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/thumbnail.jpg"
-                echo "✅ Thumbnail saved"
+                THUMB_SIZE_KB=$(echo "scale=2; $(stat -c%s "$THUMB_FILE" 2>/dev/null || echo 0) / 1024" | bc 2>/dev/null || echo "0")
+                echo "✅ Thumbnail saved: thumbnail.jpg (${THUMB_SIZE_KB} KB)"
+              else
+                echo "⚠️  No thumbnail found for this video"
               fi
 
               echo "${FILENAME_NO_EXT}|${FINAL_FOLDER_NAME}|${URL}" >> /tmp/video_info.txt
+
               FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
 
               if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
-                echo "Splitting into ${SPLIT_MB}MB parts..."
+                echo "Splitting $BASENAME into ${SPLIT_MB}MB parts..."
+
+                ARCHIVE_BASE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}"
 
                 if [ -n "$ZIP_PASSWORD" ]; then
-                  7z a -tzip -v${SPLIT_MB}m -p"${ZIP_PASSWORD}" -mx=0 "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip" "$FILE"
+                  7z a \
+                    -tzip \
+                    -v${SPLIT_MB}m \
+                    -p"${ZIP_PASSWORD}" \
+                    -mx=0 \
+                    "${ARCHIVE_BASE}.zip" \
+                    "$FILE"
                 else
-                  zip -0 -s ${SPLIT_MB}m "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip" "$FILE"
+                  zip -0 -s ${SPLIT_MB}m "${ARCHIVE_BASE}.zip" "$FILE"
                 fi
+
+                PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.zip "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z[0-9]* 2>/dev/null | wc -l)
+                echo "Created $PART_COUNT parts"
+
+                TOTAL_SIZE=0
+                for part_file in "$BACKUP_DIR/${FINAL_FOLDER_NAME}"/*; do
+                  if [ -f "$part_file" ]; then
+                    PART_SIZE=$(stat -c%s "$part_file")
+                    TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
+                  fi
+                done
+                TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+                DOWNLOAD_LINKS_MD=""
+                LINK_NUM=0
+                for part_file in $(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.zip "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z[0-9]* 2>/dev/null | sort -V); do
+                  if [ -f "$part_file" ]; then
+                    PART_BASENAME=$(basename "$part_file")
+                    PART_ENCODED=$(urlencode "${PART_BASENAME}")
+                    RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${PART_ENCODED}"
+                    LINK_NUM=$((LINK_NUM + 1))
+                    DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+                  fi
+                done
+
+                MAIN_ZIP="${FINAL_FOLDER_NAME}.zip"
 
                 cat > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md" << EOF
 # ${FILENAME_NO_EXT}
@@ -365,41 +605,54 @@ jobs:
 |----------|-------|
 | **Video Name** | \`${FILENAME_NO_EXT}\` |
 | **Original Link** | [YouTube Video](${URL}) |
+| **Total Size** | **${PART_COUNT} parts** - **${TOTAL_SIZE_MB} MB** |
 | **Quality** | **${QUALITY}** |
+| **Status** | **Complete (100%)** |
 | **Password Protected** | **$(if [ -n "$ZIP_PASSWORD" ]; then echo "YES"; else echo "NO"; fi)** |
+
+---
 
 ## Download Links
 
-Download all parts, then open \`${FINAL_FOLDER_NAME}.zip\`
+> ⬇️ Download **all parts**, then open \`${MAIN_ZIP}\` — the other parts are found automatically.
 
-| # | File |
-|---|------|
-EOF
-                PART_NUM=0
-                for PART in $(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.zip "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z[0-9]* 2>/dev/null | sort -V); do
-                  PART_NUM=$((PART_NUM + 1))
-                  PART_NAME=$(basename "$PART")
-                  echo "| ${PART_NUM} | \`${PART_NAME}\` |" >> "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
-                done
+| # | File | Link |
+|---|------|------|
+${DOWNLOAD_LINKS_MD}
 
-                cat >> "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md" << EOF
+---
 
 ## How to Extract
 
-Download all parts into the same folder, then open \`${FINAL_FOLDER_NAME}.zip\` with 7-Zip or WinRAR.
-$(if [ -n "$ZIP_PASSWORD" ]; then echo "Enter password when prompted."; fi)
+Download all parts into the **same folder**, then:
+
+| OS | Steps |
+|----|-------|
+| **Windows** | Right-click \`${MAIN_ZIP}\` → *Extract Here* (needs [7-Zip](https://www.7-zip.org/) or WinRAR) $(if [ -n "$ZIP_PASSWORD" ]; then echo "→ enter password"; fi) |
+| **Mac** | Open with [Keka](https://www.keka.io/) $(if [ -n "$ZIP_PASSWORD" ]; then echo "→ enter password"; fi) |
+| **Linux** | \`unzip ${MAIN_ZIP}\` or right-click → Extract $(if [ -n "$ZIP_PASSWORD" ]; then echo "→ enter password"; fi) |
+| **Android** | Use [ZArchiver](https://play.google.com/store/apps/details?id=ru.zdevs.zarchiver) → tap \`${MAIN_ZIP}\` $(if [ -n "$ZIP_PASSWORD" ]; then echo "→ enter password"; fi) |
 
 ---
+
 *Downloaded: $(date '+%Y-%m-%d %H:%M:%S UTC')*
 EOF
+
+                echo "Created README.md"
+
               else
                 if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -0 -P "${ZIP_PASSWORD}" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip" "$FILE"
-                else
-                  cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
-                fi
+                  echo "$BASENAME - creating password-protected zip archive"
 
-                cat > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md" << EOF
+                  zip -0 -P "${ZIP_PASSWORD}" \
+                    "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip" \
+                    "$FILE"
+
+                  SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                  FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.zip")
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                  cat > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md" << EOF
 # ${FILENAME_NO_EXT}
 
 ---
@@ -410,24 +663,96 @@ EOF
 |----------|-------|
 | **Video Name** | \`${FILENAME_NO_EXT}\` |
 | **Original Link** | [YouTube Video](${URL}) |
+| **Total Size** | **1 archive** - **${SIZE_MB} MB** |
 | **Quality** | **${QUALITY}** |
-| **Password Protected** | **$(if [ -n "$ZIP_PASSWORD" ]; then echo "YES"; else echo "NO"; fi)** |
+| **Status** | **Complete (100%)** |
+| **Password Protected** | **YES** |
+
+---
+
+## Download Link
+
+| # | File | Link |
+|---|------|------|
+| 1 | \`${FINAL_FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |
+
+---
 
 ## How to Extract
 
-$(if [ -n "$ZIP_PASSWORD" ]; then echo "Extract with password using 7-Zip or WinRAR."; else echo "No extraction needed — file is ready to use."; fi)
+| OS | Steps |
+|----|-------|
+| **Windows** | Double-click \`${FINAL_FOLDER_NAME}.zip\` → enter password |
+| **Mac** | Double-click → enter password (or use [The Unarchiver](https://theunarchiver.com/)) |
+| **Linux** | \`unzip ${FINAL_FOLDER_NAME}.zip\` → enter password |
+| **Android** | Tap the file in your file manager → enter password |
 
 ---
+
 *Downloaded: $(date '+%Y-%m-%d %H:%M:%S UTC')*
 EOF
+
+                  echo "Created password-protected zip archive and README.md"
+
+                else
+                  echo "$BASENAME - copying directly (no archive needed)"
+
+                  cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+
+                  SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                  FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.${EXT}")
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                  cat > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md" << EOF
+# ${FILENAME_NO_EXT}
+
+---
+
+## Video Information
+
+| Property | Value |
+|----------|-------|
+| **Video Name** | \`${FILENAME_NO_EXT}\` |
+| **Original Link** | [YouTube Video](${URL}) |
+| **Total Size** | **1 file** (no split) - **${SIZE_MB} MB** |
+| **Quality** | **${QUALITY}** |
+| **Status** | **Complete (100%)** |
+| **Password Protected** | **NO** |
+
+---
+
+## Download Link
+
+| # | File | Link |
+|---|------|------|
+| 1 | \`${FINAL_FOLDER_NAME}.${EXT}\` | [Download](${RAW_LINK}) |
+
+---
+
+Ready to use — no extraction needed!
+
+---
+
+*Downloaded: $(date '+%Y-%m-%d %H:%M:%S UTC')*
+EOF
+
+                  echo "Copied file and created README.md"
+                fi
               fi
             done
 
             rm -rf "$TMP_DIR"
+            echo ""
             echo "✅ Finished URL $URL_INDEX / $TOTAL_URLS"
           done
 
-      - name: Download subtitles (optional)
+          echo ""
+          echo "===== Backup folder contents ====="
+          find "$BACKUP_DIR" -type f | head -50
+          echo "===== Video info file ====="
+          cat /tmp/video_info.txt
+
+      - name: دانلود زیرنویس ها
         if: ${{ github.event.inputs.download_subtitles == 'true' }}
         run: |
           set +e
@@ -436,63 +761,132 @@ EOF
           REPO_OWNER=$(cat /tmp/yt_repo_owner.txt)
           REPO_NAME=$(cat /tmp/yt_repo_name.txt)
           BRANCH=$(cat /tmp/yt_branch.txt)
+          mapfile -t URL_LIST < /tmp/yt_urls.txt
 
-          download_subtitles() {
-            local URL="$1"
-            local OUTPUT_DIR="$2"
+          sub_download() {
+            local MODE=$1
+            local OUT="$2"
+            local SURL="$3"
+            local SUB_DIR
+            SUB_DIR=$(dirname "$OUT")
+
+            sub_count() { find "$SUB_DIR" -type f \( -name "*.vtt" -o -name "*.srt" \) 2>/dev/null | wc -l; }
+            fa_count()  { find "$SUB_DIR" -type f \( -name "*.fa.vtt" -o -name "*.fa.srt" \) 2>/dev/null | wc -l; }
+            en_count()  { find "$SUB_DIR" -type f \( -name "*.en.vtt" -o -name "*.en.srt" \) 2>/dev/null | wc -l; }
+
+            sub_flags() {
+              case $MODE in
+                all)        echo "--write-sub --sub-langs fa,en" ;;
+                fa-native)  echo "--write-sub --sub-langs fa" ;;
+                fa-auto)    echo "--write-auto-sub --sub-langs fa" ;;
+                en-auto)    echo "--write-auto-sub --sub-langs en" ;;
+                auto-both)  echo "--write-auto-sub --sub-langs en,fa" ;;
+              esac
+            }
+            SFLAGS=$(sub_flags)
+            COMMON_SUB="--sub-format vtt/srt/best --convert-subs vtt --skip-download --no-playlist --no-check-certificates --output ${OUT}"
 
             for METHOD in 1 2 3 4 5 6 7 8; do
-              yt-dlp --proxy "socks5://127.0.0.1:1080" \
-                --write-sub --sub-langs fa,en \
-                --sub-format vtt \
-                --convert-subs vtt \
-                --skip-download \
-                --no-playlist \
-                --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
-                "$URL" 2>&1 && return 0
-              sleep 2
+              echo "  [subtitle] method $METHOD ..."
+              case $METHOD in
+                1)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                2)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                3)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                4)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=mweb" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                5)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=android_vr" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                6)
+                  yt-dlp --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                7)
+                  yt-dlp --extractor-args "youtube:player_client=mweb" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+                8)
+                  yt-dlp --proxy "socks5://127.0.0.1:1080" --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" $SFLAGS $COMMON_SUB "$SURL" 2>&1 || true
+                ;;
+              esac
+
+              if [ "$MODE" = "fa-native" ] || [ "$MODE" = "fa-auto" ]; then
+                [ "$(fa_count)" -gt 0 ] && { echo "  [subtitle] ✅ success with method $METHOD"; return 0; }
+              elif [ "$MODE" = "en-auto" ]; then
+                [ "$(en_count)" -gt 0 ] && { echo "  [subtitle] ✅ success with method $METHOD"; return 0; }
+              elif [ "$MODE" = "auto-both" ]; then
+                local EN_GOT=$(en_count)
+                local FA_GOT=$(fa_count)
+                if [ "$EN_GOT" -gt 0 ] && [ "$FA_GOT" -gt 0 ]; then
+                  echo "  [subtitle] ✅ success with method $METHOD (both en+fa downloaded)"
+                  return 0
+                fi
+              else
+                [ "$(sub_count)" -gt 0 ] && { echo "  [subtitle] ✅ success with method $METHOD"; return 0; }
+              fi
+              sleep 1
             done
             return 1
           }
 
+          URL_INDEX=0
           while IFS='|' read -r ORIGINAL_NAME FOLDER_NAME VIDEO_URL; do
+            URL_INDEX=$((URL_INDEX + 1))
             [ -z "$FOLDER_NAME" ] && continue
 
             SUBTITLE_DIR="$BACKUP_DIR/${FOLDER_NAME}/subtitle"
             mkdir -p "$SUBTITLE_DIR"
+            OUT_TMPL="${SUBTITLE_DIR}/%(title)s"
 
+            echo ""
+            echo "============================================================"
             echo "Downloading subtitles for: $FOLDER_NAME"
-            download_subtitles "$VIDEO_URL" "$SUBTITLE_DIR"
+            echo "============================================================"
+
+            sub_download "all" "$OUT_TMPL" "$VIDEO_URL" || true
+
+            EN_COUNT=$(find "$SUBTITLE_DIR" -type f \( -name "*.en.vtt" -o -name "*.en.srt" \) 2>/dev/null | wc -l)
+            FA_COUNT=$(find "$SUBTITLE_DIR" -type f \( -name "*.fa.vtt" -o -name "*.fa.srt" \) 2>/dev/null | wc -l)
+
+            if [ "$EN_COUNT" -eq 0 ] || [ "$FA_COUNT" -eq 0 ]; then
+              sub_download "auto-both" "$OUT_TMPL" "$VIDEO_URL" || true
+            fi
 
             SUB_COUNT=$(find "$SUBTITLE_DIR" -type f 2>/dev/null | wc -l)
-            if [ "$SUB_COUNT" -gt 0 ]; then
-              (cd "$SUBTITLE_DIR" && zip -j "$BACKUP_DIR/${FOLDER_NAME}/subtitles.zip" ./* 2>&1)
-              rm -rf "$SUBTITLE_DIR"
-              echo "✅ Subtitles saved for: $FOLDER_NAME"
-            else
+            if [ "$SUB_COUNT" -eq 0 ]; then
               rmdir "$SUBTITLE_DIR" 2>/dev/null || true
+            else
+              ZIP_PATH="$BACKUP_DIR/${FOLDER_NAME}/subtitle.zip"
+              (cd "$SUBTITLE_DIR" && zip -j "$ZIP_PATH" ./* 2>&1) && rm -rf "$SUBTITLE_DIR"
             fi
           done < /tmp/video_info.txt
 
           set -e
+          echo "✅ Subtitle step completed"
           exit 0
 
-      - name: Stop WARP container
+      - name: متوقف کردن کانتینر
         if: always()
         run: |
           docker stop warp || true
           docker rm warp || true
 
-      - name: Push videos to repository
+      - name: ذخیره سازی دانلود شده ها
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
-          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
 
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
           BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+
           if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
-            echo "No files to push."
+            echo "No files to push. Exiting."
             exit 0
           fi
 
@@ -500,50 +894,55 @@ EOF
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
+          regenerate_master_readme() {
+            MASTER_README="videos/README.md"
+            { echo "# DOWNLOADED VIDEOS LIST :"; echo ""; echo "----"; echo ""; } > "$MASTER_README"
+            VIDEO_EMOJIS=("🎬" "🎥" "📽️" "🎞️" "📺" "🎦" "▶️")
+            NUM=0
+            for folder in videos/*/; do
+              [ -d "$folder" ] || continue
+              FOLDER_NAME=$(basename "$folder")
+              [ -f "$folder/README.md" ] || continue
+              NUM=$((NUM + 1))
+              RANDOM_EMOJI="${VIDEO_EMOJIS[$RANDOM % ${#VIDEO_EMOJIS[@]}]}"
+              FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+              FOLDER_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/videos/${FOLDER_ENCODED}"
+              printf -- "- %s - %s [%s](%s)\n" "$NUM" "$RANDOM_EMOJI" "$FOLDER_NAME" "$FOLDER_LINK" >> "$MASTER_README"
+            done
+          }
+
           git fetch origin "$BRANCH"
           git reset --hard origin/"$BRANCH"
-
           mkdir -p videos
           cp -r "$BACKUP_DIR"/* videos/
 
-          # Generate master README
-          cat > videos/README.md << EOF
-# 🎬 YouTube Downloads
+          git add -A videos/
+          regenerate_master_readme
+          git add videos/README.md
 
-| # | Video | Link |
-|---|-------|------|
-EOF
-
-          COUNTER=1
-          for folder in videos/*/; do
-            [ -d "$folder" ] || continue
-            FOLDER_NAME=$(basename "$folder")
-            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
-            echo "| ${COUNTER} | ${FOLDER_NAME} | [Open](./${FOLDER_ENCODED}/) |" >> videos/README.md
-            COUNTER=$((COUNTER + 1))
-          done
-
-          git add videos/
-          git diff --cached --quiet || git commit -m "Add YouTube videos [skip ci]"
-
-          PUSH_RETRY=0
-          while [ $PUSH_RETRY -lt 5 ]; do
-            PUSH_RETRY=$((PUSH_RETRY + 1))
-            if git push origin HEAD:"$BRANCH"; then
-              echo "✅ Push successful!"
-              break
-            else
-              echo "Push failed, retry $PUSH_RETRY/5..."
-              sleep 5
-              git fetch origin "$BRANCH"
-              git reset --hard origin/"$BRANCH"
-              mkdir -p videos
-              cp -r "$BACKUP_DIR"/* videos/
-              git add videos/
-              git diff --cached --quiet || git commit -m "Add YouTube videos [skip ci]"
-            fi
-          done
+          if ! git diff --cached --quiet; then
+            git commit -m "YouTube download [skip ci]"
+            PUSH_RETRY=0
+            while [ $PUSH_RETRY -lt 10 ]; do
+              PUSH_RETRY=$((PUSH_RETRY + 1))
+              if timeout 300 git push origin HEAD:"$BRANCH"; then
+                echo "Push successful!"
+                break
+              else
+                echo "Push failed, retry $PUSH_RETRY/10..."
+                sleep 5
+                git fetch origin "$BRANCH"
+                git reset --hard origin/"$BRANCH"
+                mkdir -p videos
+                cp -r "$BACKUP_DIR"/* videos/
+                git add -A videos/
+                regenerate_master_readme
+                git add videos/README.md
+                git diff --cached --quiet || git commit -m "YouTube download [skip ci]"
+              fi
+            done
+          fi
 
           echo "=========================================="
-          echo "✅ YouTube download completed successfully"
+          echo "All files pushed successfully!"
           echo "=========================================="
