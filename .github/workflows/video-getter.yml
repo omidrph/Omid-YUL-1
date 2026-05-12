@@ -45,7 +45,6 @@ jobs:
             echo "❌ لینک ویدیو وارد نشده است!"
             exit 1
           fi
-          echo "✅ لینک ویدیو دریافت شد"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,7 +52,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Configure Git for large files
+      - name: Configure Git
         run: |
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
@@ -64,7 +63,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-      - name: Start Cloudflare WARP
+      - name: Start WARP container
         run: |
           docker network create warp-net || true
           docker run -d \
@@ -78,7 +77,6 @@ jobs:
             -v warp-data:/var/lib/cloudflare-warp \
             caomingjun/warp
           sleep 15
-          echo "WARP proxy started on socks5://127.0.0.1:1080"
 
       - name: Install dependencies
         run: |
@@ -90,7 +88,7 @@ jobs:
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
           pip3 install --upgrade yt-dlp
 
-      - name: Download videos
+      - name: Download videos and generate READMEs
         run: |
           URLS="${{ github.event.inputs.video_urls }}"
           QUALITY="${{ github.event.inputs.quality }}"
@@ -104,12 +102,9 @@ jobs:
           echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
           > /tmp/video_info.txt
 
-          echo "======================================"
-          echo "YouTube Downloader Started"
+          echo "YouTube Downloader started"
           echo "Quality: $QUALITY"
           echo "Password: $(if [ -n "$ZIP_PASS" ]; then echo "ON"; else echo "OFF"; fi)"
-          echo "Subtitles: $DOWNLOAD_SUBS"
-          echo "======================================"
 
           sanitize_name() { echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'; }
           urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
@@ -125,7 +120,7 @@ jobs:
             *)      FORMAT="bestvideo+bestaudio" ;;
           esac
 
-          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega")
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda")
           get_random_word() { echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
           get_unique_folder() {
             local base="$1" name="$2"
@@ -159,7 +154,6 @@ jobs:
           idx=0
           for raw_url in "${URL_ARRAY[@]}"; do
             idx=$((idx+1))
-            # Normalize youtu.be
             if [[ "$raw_url" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
               url="https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
             else
@@ -203,78 +197,25 @@ jobs:
                 else
                   zip -0 -s ${SPLIT_MB}m "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                 fi
-                cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
-# $base
-
----
-
-## Video Information
-
-| Property | Value |
-|----------|-------|
-| **Video Name** | \`$base\` |
-| **Original Link** | [YouTube Video]($url) |
-| **Quality** | **$QUALITY** |
-| **Password Protected** | **$(if [ -n "$ZIP_PASS" ]; then echo "YES"; else echo "NO"; fi)** |
-
-## Download Links
-
-Download all parts, then open \`$final_folder.zip\`
-
-EOR
+                # Generate README with printf (no heredoc)
+                printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **%s** |\n\n## Download Links\n\nDownload all parts, then open `%s.zip`\n\n' "$base" "$base" "$url" "$QUALITY" "$(if [ -n "$ZIP_PASS" ]; then echo "YES"; else echo "NO"; fi)" "$final_folder" > "$BACKUP_DIR/$final_folder/README.md"
                 part_num=0
                 for part in $(ls "$BACKUP_DIR/$final_folder/"*.zip "$BACKUP_DIR/$final_folder/"*.z[0-9]* 2>/dev/null | sort -V); do
                   part_num=$((part_num+1))
                   part_name=$(basename "$part")
                   part_enc=$(urlencode "$part_name")
-                  echo "- Part $part_num: [$part_name](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${part_enc})" >> "$BACKUP_DIR/$final_folder/README.md"
+                  printf -- '- Part %d: [%s](https://github.com/%s/%s/raw/%s/videos/%s/%s)\n' "$part_num" "$part_name" "$REPO_OWNER" "$REPO_NAME" "$BRANCH" "$encoded_folder" "$part_enc" >> "$BACKUP_DIR/$final_folder/README.md"
                 done
               else
                 if [ -n "$ZIP_PASS" ]; then
                   zip -0 -P "$ZIP_PASS" "$BACKUP_DIR/$final_folder/$final_folder.zip" "$file"
                   enc_file=$(urlencode "$final_folder.zip")
-                  cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
-# $base
-
----
-
-## Video Information
-
-| Property | Value |
-|----------|-------|
-| **Video Name** | \`$base\` |
-| **Original Link** | [YouTube Video]($url) |
-| **Quality** | **$QUALITY** |
-| **Password Protected** | **YES** |
-
-## Download Link
-
-[${final_folder}.zip](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${enc_file})
-
-EOR
+                  printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **YES** |\n\n## Download Link\n\n[%s.zip](https://github.com/%s/%s/raw/%s/videos/%s/%s)\n\n' "$base" "$base" "$url" "$QUALITY" "$final_folder" "$REPO_OWNER" "$REPO_NAME" "$BRANCH" "$encoded_folder" "$enc_file" > "$BACKUP_DIR/$final_folder/README.md"
                 else
                   ext="${fname##*.}"
                   cp "$file" "$BACKUP_DIR/$final_folder/$final_folder.$ext"
                   enc_file=$(urlencode "$final_folder.$ext")
-                  cat > "$BACKUP_DIR/$final_folder/README.md" <<-EOR
-# $base
-
----
-
-## Video Information
-
-| Property | Value |
-|----------|-------|
-| **Video Name** | \`$base\` |
-| **Original Link** | [YouTube Video]($url) |
-| **Quality** | **$QUALITY** |
-| **Password Protected** | **NO** |
-
-## Download Link
-
-[${final_folder}.${ext}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${encoded_folder}/${enc_file})
-
-EOR
+                  printf '# %s\n\n---\n\n## Video Information\n\n| Property | Value |\n|----------|-------|\n| **Video Name** | `%s` |\n| **Original Link** | [YouTube Video](%s) |\n| **Quality** | **%s** |\n| **Password Protected** | **NO** |\n\n## Download Link\n\n[%s.%s](https://github.com/%s/%s/raw/%s/videos/%s/%s)\n\n' "$base" "$base" "$url" "$QUALITY" "$final_folder" "$ext" "$REPO_OWNER" "$REPO_NAME" "$BRANCH" "$encoded_folder" "$enc_file" > "$BACKUP_DIR/$final_folder/README.md"
                 fi
               fi
             done
@@ -302,7 +243,9 @@ EOR
 
       - name: Stop WARP container
         if: always()
-        run: docker stop warp || true; docker rm warp || true
+        run: |
+          docker stop warp || true
+          docker rm warp || true
 
       - name: Push videos to repository
         run: |
@@ -323,18 +266,13 @@ EOR
           mkdir -p videos
           cp -r "$BACKUP_DIR"/* videos/
 
-          cat > videos/README.md << 'EOF'
-# YouTube Downloads
-
-| # | Video | Link |
-|---|-------|------|
-EOF
+          printf '# YouTube Downloads\n\n| # | Video | Link |\n|---|-------|------|\n' > videos/README.md
           counter=1
           for folder in videos/*/; do
             [ -d "$folder" ] || continue
             fname=$(basename "$folder")
             enc=$(urlencode "$fname")
-            echo "| $counter | $fname | [Open](./$enc/) |" >> videos/README.md
+            printf '| %d | %s | [Open](./%s/) |\n' "$counter" "$fname" "$enc" >> videos/README.md
             counter=$((counter+1))
           done
 
@@ -347,4 +285,4 @@ EOF
             git add videos/
             git diff --cached --quiet || git commit -m "Add YouTube videos [skip ci]"
           done
-          echo "✅ All videos uploaded successfully"
+          echo "All videos uploaded successfully"
